@@ -5,6 +5,9 @@ go_library(
         "//eval:all",
         "//generate",
     ],
+    deps = [
+        "//logging",
+    ],
 )
 
 go_test(
