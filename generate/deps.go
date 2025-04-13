@@ -104,6 +104,7 @@ func (u *updater) reallyResolveImport(conf *config.Config, i string) (string, er
 // isInScope returns true when the given path is in scope of the current run i.e. if we are going to format the BUILD
 // file there.
 func (u *updater) isInScope(path string) bool {
+	log.Debugf("WTF: path=%v, paths=%v", path, u.paths)
 	for _, p := range u.paths {
 		if p == path {
 			return true

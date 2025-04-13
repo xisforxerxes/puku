@@ -8,8 +8,11 @@ import (
 	"github.com/please-build/buildtools/labels"
 
 	"github.com/please-build/puku/glob"
+	"github.com/please-build/puku/logging"
 	"github.com/please-build/puku/please"
 )
+
+var log = logging.GetLogger()
 
 type Eval struct {
 	globber *glob.Globber
@@ -63,6 +66,7 @@ func (e *Eval) evalGlobs(dir string, val build.Expr) ([]string, error) {
 
 func (e *Eval) BuildSources(plzPath, dir string, rule *build.Rule, srcsArg string) ([]string, error) {
 	srcs, err := e.EvalGlobs(dir, rule, srcsArg)
+	log.Debugf("BuildSources: dir=%s, rule=%s srcs: %v", dir, rule.Name(), srcs)
 	if err != nil {
 		return nil, err
 	}

@@ -4,7 +4,10 @@ go_library(
     visibility = [
         "//:all",
         "//cmd/puku:all",
+        "//edit:all",
+        "//eval:all",
         "//generate:all",
+        "//glob:all",
         "//graph:all",
         "//sync:all",
         "//watch:all",

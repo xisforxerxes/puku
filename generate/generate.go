@@ -3,6 +3,7 @@ package generate
 import (
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,8 +175,14 @@ func (u *updater) update(paths ...string) error {
 }
 
 func (u *updater) updateOne(conf *config.Config, path string) error {
-	// Find all the files in the dir
-	sources, err := ImportDir(path)
+	// Find all the Go files in the dir
+	goSources, err := ImportDir(path)
+	if err != nil {
+		return err
+	}
+
+	// Find all JS/TS files in the dir
+	jsSources, err := ImportJSDir(path)
 	if err != nil {
 		return err
 	}
@@ -193,16 +200,29 @@ func (u *updater) updateOne(conf *config.Config, path string) error {
 	// Read existing rules from file
 	rules, calls := u.readRulesFromFile(conf, file, path)
 
-	// Allocate the sources to the rules, creating new rules as necessary
-	newRules, err := u.allocateSources(conf, path, sources, rules)
+	// Allocate the Go sources to the rules, creating new rules as necessary
+	newGoRules, err := u.allocateSources(conf, path, goSources, rules)
 	if err != nil {
 		return err
 	}
 
-	rules = append(rules, newRules...)
+	rules = append(rules, newGoRules...)
 
-	// Update the existing call expressions in the build file
-	return u.updateDeps(conf, file, calls, rules, sources)
+	// Allocate the JS/TS sources to the rules, creating new rules as necessary
+	newJSRules, err := u.allocateJSSources(conf, path, jsSources, rules)
+	if err != nil {
+		return err
+	}
+
+	rules = append(rules, newJSRules...)
+
+	// Update the existing call expressions in the build file - first for Go
+	if err := u.updateDeps(conf, file, calls, rules, goSources); err != nil {
+		return err
+	}
+
+	// Then for JS/TS
+	return u.updateJSDeps(conf, file, calls, rules, jsSources)
 }
 
 func (u *updater) addNewModules(conf *config.Config) error {
@@ -390,6 +410,119 @@ func (u *updater) updateRuleDeps(conf *config.Config, rule *edit.Rule, rules []*
 	return nil
 }
 
+// allJSSources calculates the sources for a TS/JS target.
+func (u *updater) allJSSources(conf *config.Config, r *edit.Rule, sourceMap map[string]*JSFile) (passedSources []string, jsFiles map[string]*JSFile, err error) {
+	srcs, err := u.eval.BuildSources(conf.GetPlzPath(), r.Dir, r.Rule, r.SrcsAttr())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sources := make(map[string]*JSFile, len(srcs))
+	for _, src := range srcs {
+		if file, ok := sourceMap[src]; ok {
+			sources[src] = file
+			continue
+		}
+
+		// Handle generated sources in plz-out/gen
+		f, skip, err := importJSFile(".", src)
+		if err != nil {
+			continue
+		}
+		if skip {
+			continue
+		}
+		sources[src] = f
+	}
+	return srcs, sources, nil
+}
+
+// updateJSRuleDeps updates the dependencies of a TS/JS build rule based on the imports of its sources
+func (u *updater) updateJSRuleDeps(conf *config.Config, rule *edit.Rule, rules []*edit.Rule, packageFiles map[string]*JSFile) error {
+	done := map[string]struct{}{}
+
+	// Only process ts_library and remix_bundle rules
+	if rule.Kind.Name != "ts_library" && rule.Kind.Name != "remix_bundle" {
+		return nil
+	}
+
+	srcs, targetFiles, err := u.allJSSources(conf, rule, packageFiles)
+	if err != nil {
+		return err
+	}
+
+	label := edit.BuildTarget(rule.Name(), rule.Dir, "")
+
+	deps := map[string]struct{}{}
+
+	for _, src := range srcs {
+		f := targetFiles[src]
+		if f == nil {
+			log.Debugf("Removing %s", src)
+			rule.RemoveSrc(src) // The src doesn't exist so remove it from the list of srcs
+			continue
+		}
+		log.Debugf("updateJSRuleDeps: resolving imports for file: %s", src)
+		for _, i := range f.Imports {
+			log.Debugf("updateJSRuleDeps: resolving import: %v", i)
+			if _, ok := done[i]; ok {
+				continue
+			}
+			done[i] = struct{}{}
+
+			// Skip built-in Node.js modules, npm: imports, and empty paths
+			if strings.HasPrefix(i, "node:") || strings.HasPrefix(i, "npm:") || i == "" {
+				continue
+			}
+
+			// Handle relative imports specially - they need to be resolved within the package
+			if strings.HasPrefix(i, ".") || strings.HasPrefix(i, "/") {
+				// Try to resolve local package
+				relativePath := filepath.Join(rule.Dir, i)
+				// Normalize the path
+				relativePath = filepath.Clean(relativePath)
+
+				// Check if there's a ts_library or remix_bundle rule in that directory
+				for _, otherRule := range rules {
+					if (otherRule.Kind.Name == "ts_library" || otherRule.Kind.Name == "remix_bundle") && otherRule.Dir == relativePath {
+						dep := edit.BuildTarget(otherRule.Name(), relativePath, "")
+						dep = shorten(rule.Dir, dep)
+						if _, ok := deps[dep]; !ok {
+							deps[dep] = struct{}{}
+						}
+						break
+					}
+				}
+				continue
+			}
+
+			// Use our specialized JS import resolver that handles tsconfig.json path mappings
+			// and the special @/ syntax for internal packages
+			dep, skip := ResolveJSImport(i, rule.Dir)
+			if skip {
+				continue
+			}
+
+			dep = shorten(rule.Dir, dep)
+			if _, ok := deps[dep]; !ok {
+				deps[dep] = struct{}{}
+			}
+		}
+	}
+
+	depSlice := make([]string, 0, len(deps))
+	for dep := range deps {
+		u.graph.EnsureVisibility(label, dep)
+		depSlice = append(depSlice, dep)
+	}
+
+	log.Debugf("Setting deps for %v to %v", rule.Name(), deps)
+
+	rule.SetOrDeleteAttr("deps", depSlice)
+
+	return nil
+}
+
 // shorten will shorten lables to the local package
 func shorten(pkg, label string) string {
 	if strings.HasPrefix(label, "///") || strings.HasPrefix(label, "@") {
@@ -421,10 +554,53 @@ func (u *updater) readRulesFromFile(conf *config.Config, file *build.File, pkgDi
 // updateDeps updates the existing rules and creates any new rules in the BUILD file
 func (u *updater) updateDeps(conf *config.Config, file *build.File, ruleExprs map[string]*build.Rule, rules []*edit.Rule, sources map[string]*GoFile) error {
 	for _, rule := range rules {
+		if rule.Kind.Language != kinds.Go {
+			continue
+		}
 		if _, ok := ruleExprs[rule.Name()]; !ok {
 			file.Stmt = append(file.Stmt, rule.Call)
 		}
 		if err := u.updateRuleDeps(conf, rule, rules, sources); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateJSDeps updates dependencies for JavaScript/TypeScript rules
+func (u *updater) updateJSDeps(conf *config.Config, file *build.File, ruleExprs map[string]*build.Rule, rules []*edit.Rule, sources map[string]*JSFile) error {
+	for _, rule := range rules {
+		if rule.Kind.Language != kinds.JS {
+			continue
+		}
+		if _, ok := ruleExprs[rule.Name()]; !ok {
+			file.Stmt = append(file.Stmt, rule.Call)
+		}
+
+		ruleSrcs, err := u.eval.EvalGlobs(rule.Dir, rule.Rule, rule.SrcsAttr())
+		if err != nil {
+			return err
+		}
+
+		allSrcs := make(map[string]*JSFile, len(sources))
+		maps.Copy(allSrcs, sources)
+
+		for _, s := range ruleSrcs {
+			if filepath.Ext(s) != ".ts" && filepath.Ext(s) != ".tsx" {
+				continue
+			}
+			f, skip, err := importJSFile(rule.Dir, s)
+			if err != nil {
+				return err
+			}
+			if skip {
+				continue
+			}
+			log.Debugf("Adding ruleSrc: %v, f: %+v", s, f)
+			allSrcs[s] = f
+		}
+
+		if err := u.updateJSRuleDeps(conf, rule, rules, allSrcs); err != nil {
 			return err
 		}
 	}
@@ -487,6 +663,68 @@ func (u *updater) allocateSources(conf *config.Config, pkgDir string, sources ma
 	return newRules, nil
 }
 
+// allocateJSSources allocates JS/TS sources to rules, creating new rules as necessary
+func (u *updater) allocateJSSources(conf *config.Config, pkgDir string, sources map[string]*JSFile, rules []*edit.Rule) ([]*edit.Rule, error) {
+	unallocated, err := u.unallocatedJSSources(sources, rules)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if there are any JS/TS files to allocate
+	if len(unallocated) == 0 {
+		return nil, nil
+	}
+
+	// First, check if there are any existing ts_library or remix_bundle rules we can add to
+	var jsRule *edit.Rule
+	for _, r := range rules {
+		if r.Kind.Name == "ts_library" || r.Kind.Name == "remix_bundle" {
+			jsRule = r
+			break
+		}
+	}
+
+	log.Debugf("located rule: %v", jsRule)
+
+	// If no existing rule found, create a new one
+	if jsRule == nil {
+		name := filepath.Base(pkgDir)
+		// Default to ts_library
+		kind := "ts_library"
+
+		// Look for common JS framework patterns to determine the kind
+		for _, src := range unallocated {
+			fileName := filepath.Base(src)
+			// If we find app.jsx or similar, use remix_bundle
+			if strings.HasPrefix(fileName, "app.") || strings.HasPrefix(fileName, "entry.client.") || strings.HasPrefix(fileName, "entry.server.") {
+				kind = "remix_bundle"
+				break
+			}
+		}
+
+		jsRule = edit.NewRule(edit.NewRuleExpr(kind, name), kinds.DefaultKinds[kind], pkgDir)
+
+		// Add the rule to the list of new rules
+		var newRules []*edit.Rule
+		newRules = append(newRules, jsRule)
+
+		// Add all unallocated JS/TS files to this rule
+		for _, src := range unallocated {
+			jsRule.AddSrc(src)
+		}
+
+		return newRules, nil
+	}
+
+	// Add unallocated sources to the existing rule
+	log.Debugf("unallocated: %v", unallocated)
+	for _, src := range unallocated {
+		jsRule.AddSrc(src)
+	}
+
+	return nil, nil
+}
+
 // rulePkg checks the first source it finds for a rule and returns the name from the "package name" directive at the top
 // of the file
 func (u *updater) rulePkg(conf *config.Config, srcs map[string]*GoFile, rule *edit.Rule) (string, error) {
@@ -511,6 +749,34 @@ func (u *updater) rulePkg(conf *config.Config, srcs map[string]*GoFile, rule *ed
 
 // unallocatedSources returns all the sources that don't already belong to a rule
 func (u *updater) unallocatedSources(srcs map[string]*GoFile, rules []*edit.Rule) ([]string, error) {
+	var ret []string
+	for src := range srcs {
+		found := false
+		for _, rule := range rules {
+			if found {
+				break
+			}
+
+			ruleSrcs, err := u.eval.EvalGlobs(rule.Dir, rule.Rule, rule.SrcsAttr())
+			if err != nil {
+				return nil, err
+			}
+			for _, s := range ruleSrcs {
+				if s == src {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			ret = append(ret, src)
+		}
+	}
+	return ret, nil
+}
+
+// unallocatedJSSources returns all the JS/TS sources that don't already belong to a rule
+func (u *updater) unallocatedJSSources(srcs map[string]*JSFile, rules []*edit.Rule) ([]string, error) {
 	var ret []string
 	for src := range srcs {
 		found := false
