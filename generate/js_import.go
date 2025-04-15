@@ -219,13 +219,13 @@ func FindTSConfig(dir string) (*TSConfig, string, error) {
 }
 
 // ResolveJSImport converts JS/TS imports to appropriate BUILD targets
-func ResolveJSImport(importPath string, currentDir string) (string, bool) {
+func ResolveJSImport(importPath string, currentDir string) (resolved string, local bool, skip bool) {
 	log.Debugf("ResolveJSImport: path=%s, dir=%s", importPath, currentDir)
 	// Special case: handle @ prefix for internal packages according to the example
 	if strings.HasPrefix(importPath, "@/") {
 		// TODO(ryan): Improve this to actually use and understand the path mapping?
 		// Convert @/services/catalog/proto -> //services/catalog/proto
-		return "//" + importPath[2:], false
+		return "//" + importPath[2:], true, false
 	}
 
 	if strings.HasPrefix(importPath, "~/") {
@@ -234,7 +234,7 @@ func ResolveJSImport(importPath string, currentDir string) (string, bool) {
 		// TODO(ryan): Think of a better way to accommodate this bs. I'm not sure if it'll come from devising a better way
 		// to handle the bundling of remix related shenanigans or by somehow making this a bit of configuration or what.
 		// but this will do for now.
-		return "", true
+		return "", true, true
 	}
 
 	// Try to find a tsconfig.json to use for path mapping
@@ -268,23 +268,23 @@ func ResolveJSImport(importPath string, currentDir string) (string, bool) {
 					// Calculate the target relative to the project root
 					relPath := filepath.Join(tsConfigDir, target)
 					// Convert to a BUILD target path
-					return "//" + filepath.ToSlash(relPath), false
+					return "//" + filepath.ToSlash(relPath), true, false
 				}
 
 				// TODO(ryan): This can be removed, but I'll do that in the cleanup pass.
 				// If already a BUILD target (starts with //), return as is
 				if strings.HasPrefix(target, "//") {
-					return target, false
+					return target, true, false
 				}
 
 				// Otherwise, treat as a local path
-				return "//" + target, false
+				return "//" + target, false, false
 			}
 		}
 	}
 
 	// Default to third-party for non-mapped paths with the format ///third_party/js/npm//:package_with_underscores
-	return "///third_party/js/npm//:" + strings.ReplaceAll(GetNPMPackageName(importPath), "/", "_"), false
+	return "///third_party/js/npm//:" + strings.ReplaceAll(GetNPMPackageName(importPath), "/", "_"), false, false
 }
 
 func GetNPMPackageName(importPath string) string {

@@ -498,9 +498,19 @@ func (u *updater) updateJSRuleDeps(conf *config.Config, rule *edit.Rule, rules [
 
 			// Use our specialized JS import resolver that handles tsconfig.json path mappings
 			// and the special @/ syntax for internal packages
-			dep, skip := ResolveJSImport(i, rule.Dir)
+			dep, local, skip := ResolveJSImport(i, rule.Dir)
 			if skip {
 				continue
+			}
+
+			if local {
+				t, err := u.localDep(dep)
+				if err != nil {
+					return err
+				}
+				if t == "" {
+					return fmt.Errorf("Could not find build target for %v", dep)
+				}
 			}
 
 			dep = shorten(rule.Dir, dep)
